@@ -1,6 +1,6 @@
 -- Durable queue fields for API/worker separation. Safe to run repeatedly.
--- Run with psql autocommit; do not wrap this migration in a transaction because
--- the final idempotency index is built CONCURRENTLY.
+-- This migration is psql-only. Run with autocommit and do not wrap it in an
+-- explicit transaction because indexes are built and repaired CONCURRENTLY.
 ALTER TABLE rlm_runs
   ADD COLUMN IF NOT EXISTS namespace TEXT NOT NULL DEFAULT 'default',
   ADD COLUMN IF NOT EXISTS context TEXT,
@@ -80,6 +80,44 @@ ALTER TABLE rlm_runs
 
 ALTER TABLE rlm_runs
   ALTER COLUMN context SET NOT NULL;
+
+-- A failed concurrent build leaves an invalid catalog entry that IF NOT EXISTS
+-- would otherwise preserve. Generate schema-qualified concurrent drops for
+-- invalid remnants owned by the tables and index names managed below.
+SELECT format(
+         'DROP INDEX CONCURRENTLY IF EXISTS %s',
+         format('%I.%I', index_namespace.nspname, index_class.relname)
+       )
+FROM pg_index AS index_state
+JOIN pg_class AS index_class
+  ON index_class.oid = index_state.indexrelid
+JOIN pg_namespace AS index_namespace
+  ON index_namespace.oid = index_class.relnamespace
+WHERE NOT index_state.indisvalid
+  AND (
+    (
+      index_state.indrelid = to_regclass('rlm_runs')
+      AND index_class.relname IN (
+        'rlm_runs_queue_idx',
+        'rlm_runs_stale_worker_idx',
+        'rlm_runs_tenant_lookup_idx'
+      )
+    )
+    OR (
+      index_state.indrelid = to_regclass('rlm_events')
+      AND index_class.relname = 'rlm_events_run_created_idx'
+    )
+    OR (
+      index_state.indrelid = to_regclass('rlm_summary_outbox')
+      AND index_class.relname = 'rlm_summary_outbox_pending_idx'
+    )
+    OR (
+      index_state.indrelid = to_regclass('memory_items')
+      AND index_class.relname = 'memory_run_summary_source_idx'
+    )
+  )
+ORDER BY index_namespace.nspname, index_class.relname
+\gexec
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS rlm_runs_queue_idx
   ON rlm_runs (available_at, created_at)

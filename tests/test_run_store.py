@@ -8,6 +8,7 @@ import pytest
 from run_store import (
     RunStatus,
     RunStore,
+    SummaryOutboxItem,
     decode_claimed_run,
     failure_status,
     retry_delay_seconds,
@@ -133,6 +134,40 @@ class FakeRecoveryPool:
         return AsyncContext(self.connection)
 
 
+def summary_row() -> dict[str, object]:
+    return {
+        "run_id": "00000000-0000-0000-0000-000000000011",
+        "tenant_id": "tenant-a",
+        "subject_id": "subject-a",
+        "namespace": "default",
+        "embedding_model": "provider/embed",
+        "embedding_dim": 3,
+        "content": "summary",
+        "metadata": '{"run_id":"00000000-0000-0000-0000-000000000011"}',
+        "attempts": 1,
+    }
+
+
+class FakeSummaryPool:
+    def __init__(self) -> None:
+        malformed = summary_row()
+        malformed["embedding_dim"] = "3"
+        valid = summary_row()
+        valid["run_id"] = "00000000-0000-0000-0000-000000000012"
+        self.rows = [malformed, valid]
+        self.quarantined = 0
+
+    async def fetchrow(
+        self, query: str, worker_id: str, stale_seconds: int
+    ) -> dict[str, object] | None:
+        return self.rows.pop(0) if self.rows else None
+
+    async def execute(self, query: str, *values: object) -> str:
+        if "invalid_persisted_configuration" in query:
+            self.quarantined += 1
+        return "UPDATE 1"
+
+
 def test_retry_backoff_is_exponential_and_bounded() -> None:
     assert [retry_delay_seconds(attempt) for attempt in range(1, 5)] == [
         1,
@@ -174,12 +209,22 @@ def test_claim_decoder_requires_complete_valid_configuration() -> None:
 
 def test_get_only_exposes_requested_trajectory() -> None:
     without = RunStore(FakeGetPool(False))  # type: ignore[arg-type]
-    result = asyncio.run(without.get(run_id="run-1", tenant_id="tenant-a"))
+    result = asyncio.run(
+        without.get(
+            run_id="00000000-0000-0000-0000-000000000001",
+            tenant_id="tenant-a",
+        )
+    )
     assert result is not None
     assert "trajectory" not in result
 
     with_trajectory = RunStore(FakeGetPool(True))  # type: ignore[arg-type]
-    result = asyncio.run(with_trajectory.get(run_id="run-1", tenant_id="tenant-a"))
+    result = asyncio.run(
+        with_trajectory.get(
+            run_id="00000000-0000-0000-0000-000000000001",
+            tenant_id="tenant-a",
+        )
+    )
     assert result is not None
     assert result["trajectory"] == [{"step": 1}]
 
@@ -208,3 +253,27 @@ def test_stale_recovery_is_bounded_and_deterministically_ordered() -> None:
     )
     with pytest.raises(ValueError, match="batch_size"):
         asyncio.run(store.recover_stale(stale_seconds=60, batch_size=0))
+
+
+def test_summary_claim_quarantines_poison_and_continues() -> None:
+    pool = FakeSummaryPool()
+    store = RunStore(pool)  # type: ignore[arg-type]
+    item = asyncio.run(
+        store.claim_summary(
+            worker_id="summary-worker",
+            stale_seconds=60,
+            max_quarantined=3,
+        )
+    )
+    assert isinstance(item, SummaryOutboxItem)
+    assert item.run_id == "00000000-0000-0000-0000-000000000012"
+    assert pool.quarantined == 1
+
+    with pytest.raises(ValueError, match="max_quarantined"):
+        asyncio.run(
+            store.claim_summary(
+                worker_id="summary-worker",
+                stale_seconds=60,
+                max_quarantined=0,
+            )
+        )

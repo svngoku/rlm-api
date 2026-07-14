@@ -383,50 +383,78 @@ class RunStore:
         return next_status
 
     async def claim_summary(
-        self, *, worker_id: str, stale_seconds: int
+        self,
+        *,
+        worker_id: str,
+        stale_seconds: int,
+        max_quarantined: int = 10,
     ) -> SummaryOutboxItem | None:
-        row = await self.pool.fetchrow(
-            """
-            WITH candidate AS (
-                SELECT run_id
-                FROM rlm_summary_outbox
-                WHERE completed_at IS NULL
-                  AND available_at <= now()
-                  AND (
-                    claimed_at IS NULL
-                    OR claimed_at < now() - make_interval(secs => $2)
-                  )
-                ORDER BY available_at, created_at
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
+        if max_quarantined < 1:
+            raise ValueError("max_quarantined must be positive")
+        for _ in range(max_quarantined):
+            row = await self.pool.fetchrow(
+                """
+                WITH candidate AS (
+                    SELECT run_id
+                    FROM rlm_summary_outbox
+                    WHERE completed_at IS NULL
+                      AND available_at <= now()
+                      AND (
+                        claimed_at IS NULL
+                        OR claimed_at < now() - make_interval(secs => $2)
+                      )
+                    ORDER BY available_at, created_at
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE rlm_summary_outbox AS item
+                SET claimed_by = $1,
+                    claimed_at = now(),
+                    attempts = item.attempts + 1,
+                    updated_at = now()
+                FROM candidate
+                WHERE item.run_id = candidate.run_id
+                RETURNING item.run_id, item.tenant_id, item.subject_id,
+                          item.namespace, item.embedding_model, item.embedding_dim,
+                          item.content, item.metadata, item.attempts
+                """,
+                worker_id,
+                stale_seconds,
             )
-            UPDATE rlm_summary_outbox AS item
-            SET claimed_by = $1,
-                claimed_at = now(),
-                attempts = item.attempts + 1,
+            if row is None:
+                return None
+            try:
+                return SummaryOutboxItem(
+                    run_id=str(row["run_id"]),
+                    tenant_id=_required_text(row["tenant_id"], "tenant_id"),
+                    subject_id=_required_text(row["subject_id"], "subject_id"),
+                    namespace=_required_text(row["namespace"], "namespace"),
+                    embedding_model=_required_text(row["embedding_model"], "embedding_model"),
+                    embedding_dim=_required_int(row["embedding_dim"], "embedding_dim"),
+                    content=_required_text(row["content"], "content"),
+                    metadata=_json_object(row["metadata"]),
+                    attempts=_required_int(row["attempts"], "attempts"),
+                    worker_id=worker_id,
+                )
+            except (KeyError, TypeError, ValueError):
+                await self._quarantine_summary_claim(run_id=str(row["run_id"]), worker_id=worker_id)
+        return None
+
+    async def _quarantine_summary_claim(self, *, run_id: str, worker_id: str) -> None:
+        await self.pool.execute(
+            """
+            UPDATE rlm_summary_outbox
+            SET completed_at = now(),
+                last_error = 'invalid_persisted_configuration',
+                claimed_by = NULL,
+                claimed_at = NULL,
                 updated_at = now()
-            FROM candidate
-            WHERE item.run_id = candidate.run_id
-            RETURNING item.run_id, item.tenant_id, item.subject_id,
-                      item.namespace, item.embedding_model, item.embedding_dim,
-                      item.content, item.metadata, item.attempts
+            WHERE run_id = $1::uuid
+              AND completed_at IS NULL
+              AND claimed_by = $2
             """,
+            run_id,
             worker_id,
-            stale_seconds,
-        )
-        if row is None:
-            return None
-        return SummaryOutboxItem(
-            run_id=str(row["run_id"]),
-            tenant_id=_required_text(row["tenant_id"], "tenant_id"),
-            subject_id=_required_text(row["subject_id"], "subject_id"),
-            namespace=_required_text(row["namespace"], "namespace"),
-            embedding_model=_required_text(row["embedding_model"], "embedding_model"),
-            embedding_dim=_required_int(row["embedding_dim"], "embedding_dim"),
-            content=_required_text(row["content"], "content"),
-            metadata=_json_object(row["metadata"]),
-            attempts=_required_int(row["attempts"], "attempts"),
-            worker_id=worker_id,
         )
 
     async def complete_summary(self, item: SummaryOutboxItem) -> bool:
