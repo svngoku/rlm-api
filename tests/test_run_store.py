@@ -111,6 +111,28 @@ class FakeClaimPool:
         return AsyncContext(self.connection)
 
 
+class FakeRecoveryConnection:
+    def __init__(self) -> None:
+        self.query = ""
+        self.arguments: tuple[object, ...] = ()
+
+    def transaction(self) -> AsyncContext:
+        return AsyncContext(self)
+
+    async def fetch(self, query: str, *arguments: object) -> list[object]:
+        self.query = query
+        self.arguments = arguments
+        return []
+
+
+class FakeRecoveryPool:
+    def __init__(self) -> None:
+        self.connection = FakeRecoveryConnection()
+
+    def acquire(self) -> AsyncContext:
+        return AsyncContext(self.connection)
+
+
 def test_retry_backoff_is_exponential_and_bounded() -> None:
     assert [retry_delay_seconds(attempt) for attempt in range(1, 5)] == [
         1,
@@ -169,3 +191,20 @@ def test_claim_quarantines_poison_and_continues_to_valid_row() -> None:
     assert claimed is not None
     assert claimed.id == "00000000-0000-0000-0000-000000000002"
     assert pool.connection.quarantined == 1
+
+
+def test_stale_recovery_is_bounded_and_deterministically_ordered() -> None:
+    pool = FakeRecoveryPool()
+    store = RunStore(pool)  # type: ignore[arg-type]
+    assert asyncio.run(store.recover_stale(stale_seconds=60, batch_size=7)) == (
+        0,
+        0,
+    )
+    assert pool.connection.arguments == (60, 7)
+    assert "ORDER BY stale_at, id" in pool.connection.query
+    assert "LIMIT $2" in pool.connection.query
+    assert pool.connection.query.index("LIMIT $2") < pool.connection.query.index(
+        "FOR UPDATE SKIP LOCKED"
+    )
+    with pytest.raises(ValueError, match="batch_size"):
+        asyncio.run(store.recover_stale(stale_seconds=60, batch_size=0))

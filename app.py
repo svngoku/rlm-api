@@ -7,9 +7,10 @@ import json
 import logging
 import uuid
 from datetime import datetime
+from typing import Annotated
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, StringConstraints, ValidationError
 from robyn import Request, Response, Robyn
 
 from auth import (
@@ -65,6 +66,18 @@ class WriteMemory(BaseModel):
     metadata: dict[str, JSONValue] = Field(default_factory=dict)
     importance: float = Field(default=0.5, ge=0, le=1)
     expires_at: datetime | None = None
+
+
+class MemorySearchParams(BaseModel):
+    tenant_id: str | None = None
+    subject_id: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=256)
+    ]
+    namespace: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)
+    ] = "default"
+    q: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=20_000)]
+    limit: int = Field(default=8, ge=1, le=20)
 
 
 @app.startup_handler
@@ -284,33 +297,27 @@ async def search_memory(request: Request) -> Response:
     if error is not None:
         return error
     assert principal is not None
-    query = request.query_params
-    subject_id = query.get("subject_id", "")
-    search_text = query.get("q", "")
-    if not subject_id or not search_text:
-        return _response(400, {"error": "subject_id_and_q_are_required"}, request_id)
+    search, validation_error = validate_memory_search_params(request.query_params)
+    if validation_error is not None:
+        return _response(400, {"error": validation_error}, request_id)
+    assert search is not None
     try:
         enforce_scope(
             principal,
-            tenant_id=query.get("tenant_id"),
-            subject_id=subject_id,
+            tenant_id=search.tenant_id,
+            subject_id=search.subject_id,
         )
-        limit = int(query.get("limit", "8"))
-        if not 1 <= limit <= 20:
-            raise ValueError
     except PermissionError as exc:
         return _response(403, {"error": str(exc)}, request_id)
-    except ValueError:
-        return _response(400, {"error": "limit_must_be_between_1_and_20"}, request_id)
     if memory_store is None:
         return _response(503, {"error": "service_not_ready"}, request_id)
     try:
         results = await memory_store.search(
             tenant_id=principal.tenant_id,
-            subject_id=subject_id,
-            namespace=query.get("namespace", "default"),
-            query=search_text,
-            limit=limit,
+            subject_id=search.subject_id,
+            namespace=search.namespace,
+            query=search.q,
+            limit=search.limit,
         )
     except Exception as error:
         logger.error(
@@ -430,6 +437,23 @@ def _validation_details(error: ValidationError) -> list[dict[str, object]]:
         }
         for item in error.errors()
     ]
+
+
+def validate_memory_search_params(
+    values: object,
+) -> tuple[MemorySearchParams | None, str | None]:
+    try:
+        return MemorySearchParams.model_validate(values), None
+    except ValidationError as error:
+        field = str(error.errors()[0]["loc"][0])
+        error_codes = {
+            "subject_id": "invalid_subject_id",
+            "namespace": "invalid_namespace",
+            "q": "invalid_query",
+            "limit": "invalid_limit",
+            "tenant_id": "invalid_tenant_id",
+        }
+        return None, error_codes.get(field, "invalid_search_parameters")
 
 
 if __name__ == "__main__":

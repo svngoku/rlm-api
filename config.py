@@ -34,6 +34,7 @@ class Settings:
     worker_stale_seconds: int = 600
     worker_batch_size: int = 1
     worker_max_poll_failures: int = 5
+    worker_recovery_batch_size: int = 100
 
     @property
     def public_model_config(self) -> dict[str, str | int]:
@@ -64,6 +65,7 @@ class Settings:
         worker_stale_seconds = _positive_int(env, "WORKER_STALE_SECONDS", default=600)
         worker_batch_size = _positive_int(env, "WORKER_BATCH_SIZE", default=1)
         worker_max_poll_failures = _positive_int(env, "WORKER_MAX_POLL_FAILURES", default=5)
+        worker_recovery_batch_size = _positive_int(env, "WORKER_RECOVERY_BATCH_SIZE", default=100)
         worker_poll_seconds = _positive_float(env, "WORKER_POLL_SECONDS", default=1.0)
         if root_model == sub_model:
             warnings.warn(
@@ -84,6 +86,7 @@ class Settings:
             worker_stale_seconds=worker_stale_seconds,
             worker_batch_size=worker_batch_size,
             worker_max_poll_failures=worker_max_poll_failures,
+            worker_recovery_batch_size=worker_recovery_batch_size,
         )
 
 
@@ -99,6 +102,8 @@ def _parse_api_keys(raw: str) -> dict[str, Credential]:
     for token, value in decoded.items():
         if not isinstance(token, str) or not token.strip():
             raise ConfigurationError("API_KEYS_JSON contains an empty API key")
+        if token != token.strip():
+            raise ConfigurationError("API_KEYS_JSON keys must not contain surrounding whitespace")
         if isinstance(value, str):
             tenant_id = value.strip()
             subject_id = None

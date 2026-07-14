@@ -46,10 +46,19 @@ async def process_claim(
     store: RunStore,
     memory: MemoryStore,
     stale_seconds: int,
+    expected_embedding_model: str,
+    expected_embedding_dim: int,
 ) -> None:
     started = time.monotonic()
     lease_lost = asyncio.Event()
-    execution_task = asyncio.create_task(_execute_claim(run, memory))
+    execution_task = asyncio.create_task(
+        _execute_claim(
+            run,
+            memory,
+            expected_embedding_model=expected_embedding_model,
+            expected_embedding_dim=expected_embedding_dim,
+        )
+    )
     heartbeat_task = asyncio.create_task(
         _heartbeat_loop(
             run,
@@ -140,8 +149,17 @@ async def process_claim(
 
 
 async def _execute_claim(
-    run: ClaimedRun, memory: MemoryStore
+    run: ClaimedRun,
+    memory: MemoryStore,
+    *,
+    expected_embedding_model: str,
+    expected_embedding_dim: int,
 ) -> tuple[RLMSubprocessResult, list[Memory]]:
+    validate_embedding_compatibility(
+        run.model_config,
+        expected_model=expected_embedding_model,
+        expected_dim=expected_embedding_dim,
+    )
     root_model_id = _model_id(run.model_config, "root_model")
     sub_model_id = _model_id(run.model_config, "sub_model")
     async with asyncio.timeout(run.limits["timeout_s"]):
@@ -374,7 +392,10 @@ async def _poll_cycle(
 ) -> tuple[float, int]:
     now = time.monotonic()
     if now - last_recovery >= max(10.0, settings.worker_stale_seconds / 2):
-        retried, failed = await store.recover_stale(stale_seconds=settings.worker_stale_seconds)
+        retried, failed = await store.recover_stale(
+            stale_seconds=settings.worker_stale_seconds,
+            batch_size=settings.worker_recovery_batch_size,
+        )
         if retried or failed:
             logger.warning(
                 "stale_runs_recovered",
@@ -397,7 +418,13 @@ async def _poll_cycle(
         if summary is None:
             break
         processed += 1
-        await _deliver_summary(summary, store=store, memory=memory)
+        await _deliver_summary(
+            summary,
+            store=store,
+            memory=memory,
+            expected_embedding_model=settings.embedding_model,
+            expected_embedding_dim=settings.embedding_dim,
+        )
 
     for _ in range(settings.worker_batch_size):
         run = await store.claim(worker_id=worker_id)
@@ -409,13 +436,37 @@ async def _poll_cycle(
             store=store,
             memory=memory,
             stale_seconds=settings.worker_stale_seconds,
+            expected_embedding_model=settings.embedding_model,
+            expected_embedding_dim=settings.embedding_dim,
         )
     return last_recovery, processed
 
 
 async def _deliver_summary(
-    item: SummaryOutboxItem, *, store: RunStore, memory: MemoryStore
+    item: SummaryOutboxItem,
+    *,
+    store: RunStore,
+    memory: MemoryStore,
+    expected_embedding_model: str,
+    expected_embedding_dim: int,
 ) -> None:
+    if (
+        item.embedding_model != expected_embedding_model
+        or item.embedding_dim != expected_embedding_dim
+    ):
+        retried = await store.retry_summary(item, public_error="embedding_configuration_mismatch")
+        logger.warning(
+            "run_summary_embedding_configuration_mismatch",
+            extra={
+                "context": log_context(
+                    run_id=item.run_id,
+                    tenant_id=item.tenant_id,
+                    attempt=item.attempts,
+                    lease_retained=retried,
+                )
+            },
+        )
+        return
     try:
         await memory.write(
             tenant_id=item.tenant_id,
@@ -461,6 +512,19 @@ def next_poll_failure_count(current: int, *, max_failures: int) -> int:
     if updated >= max_failures:
         raise PollFailureThresholdExceeded("worker poll failure threshold reached")
     return updated
+
+
+def validate_embedding_compatibility(
+    model_config: Mapping[str, str | int],
+    *,
+    expected_model: str,
+    expected_dim: int,
+) -> None:
+    if (
+        model_config.get("embedding_model") != expected_model
+        or model_config.get("embedding_dim") != expected_dim
+    ):
+        raise ValueError("persisted embedding configuration does not match worker")
 
 
 async def main() -> None:

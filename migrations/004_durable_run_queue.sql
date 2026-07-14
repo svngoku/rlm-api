@@ -40,11 +40,18 @@ SET context = ''
 WHERE status IN ('succeeded', 'failed')
   AND context IS NULL;
 
-ALTER TABLE rlm_runs
-  ALTER COLUMN context SET NOT NULL;
-
 DO $$
 BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'rlm_runs_context_not_null'
+      AND conrelid = 'rlm_runs'::regclass
+  ) THEN
+    ALTER TABLE rlm_runs
+      ADD CONSTRAINT rlm_runs_context_not_null
+      CHECK (context IS NOT NULL) NOT VALID;
+  END IF;
   IF NOT EXISTS (
     SELECT 1
     FROM pg_constraint
@@ -68,18 +75,24 @@ BEGIN
 END
 $$;
 
-CREATE INDEX IF NOT EXISTS rlm_runs_queue_idx
+ALTER TABLE rlm_runs
+  VALIDATE CONSTRAINT rlm_runs_context_not_null;
+
+ALTER TABLE rlm_runs
+  ALTER COLUMN context SET NOT NULL;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS rlm_runs_queue_idx
   ON rlm_runs (available_at, created_at)
   WHERE status = 'queued';
 
-CREATE INDEX IF NOT EXISTS rlm_runs_stale_worker_idx
+CREATE INDEX CONCURRENTLY IF NOT EXISTS rlm_runs_stale_worker_idx
   ON rlm_runs (worker_heartbeat_at)
   WHERE status = 'running';
 
-CREATE INDEX IF NOT EXISTS rlm_runs_tenant_lookup_idx
+CREATE INDEX CONCURRENTLY IF NOT EXISTS rlm_runs_tenant_lookup_idx
   ON rlm_runs (tenant_id, id);
 
-CREATE INDEX IF NOT EXISTS rlm_events_run_created_idx
+CREATE INDEX CONCURRENTLY IF NOT EXISTS rlm_events_run_created_idx
   ON rlm_events (run_id, created_at);
 
 CREATE TABLE IF NOT EXISTS rlm_summary_outbox (
@@ -87,6 +100,8 @@ CREATE TABLE IF NOT EXISTS rlm_summary_outbox (
   tenant_id    TEXT NOT NULL,
   subject_id   TEXT NOT NULL,
   namespace    TEXT NOT NULL,
+  embedding_model TEXT NOT NULL,
+  embedding_dim INTEGER NOT NULL CHECK (embedding_dim > 0),
   content      TEXT NOT NULL,
   metadata     JSONB NOT NULL DEFAULT '{}'::jsonb,
   attempts     INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
@@ -101,7 +116,49 @@ CREATE TABLE IF NOT EXISTS rlm_summary_outbox (
 
 ALTER TABLE rlm_summary_outbox ENABLE ROW LEVEL SECURITY;
 
-CREATE INDEX IF NOT EXISTS rlm_summary_outbox_pending_idx
+ALTER TABLE rlm_summary_outbox
+  ADD COLUMN IF NOT EXISTS embedding_model TEXT,
+  ADD COLUMN IF NOT EXISTS embedding_dim INTEGER;
+
+UPDATE rlm_summary_outbox AS outbox
+SET embedding_model = NULLIF(btrim(run.model_config->>'embedding_model'), ''),
+    embedding_dim = CASE
+      WHEN run.model_config->>'embedding_dim' ~ '^[1-9][0-9]{0,8}$'
+      THEN (run.model_config->>'embedding_dim')::INTEGER
+      ELSE NULL
+    END,
+    updated_at = now()
+FROM rlm_runs AS run
+WHERE run.id = outbox.run_id
+  AND (outbox.embedding_model IS NULL OR outbox.embedding_dim IS NULL);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'rlm_summary_outbox_embedding_not_null'
+      AND conrelid = 'rlm_summary_outbox'::regclass
+  ) THEN
+    ALTER TABLE rlm_summary_outbox
+      ADD CONSTRAINT rlm_summary_outbox_embedding_not_null
+      CHECK (
+        embedding_model IS NOT NULL
+        AND embedding_dim IS NOT NULL
+        AND embedding_dim > 0
+      ) NOT VALID;
+  END IF;
+END
+$$;
+
+ALTER TABLE rlm_summary_outbox
+  VALIDATE CONSTRAINT rlm_summary_outbox_embedding_not_null;
+
+ALTER TABLE rlm_summary_outbox
+  ALTER COLUMN embedding_model SET NOT NULL,
+  ALTER COLUMN embedding_dim SET NOT NULL;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS rlm_summary_outbox_pending_idx
   ON rlm_summary_outbox (available_at, created_at)
   WHERE completed_at IS NULL;
 

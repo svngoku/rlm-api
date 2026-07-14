@@ -18,6 +18,7 @@ class FakeStore:
         self.events: list[str] = []
         self.complete_summary_calls = 0
         self.retry_summary_calls = 0
+        self.last_retryable: bool | None = None
 
     async def succeed(self, run: ClaimedRun, **values: object) -> bool:
         self.succeed_calls += 1
@@ -25,6 +26,8 @@ class FakeStore:
 
     async def fail(self, run: ClaimedRun, **values: object) -> None:
         self.fail_calls += 1
+        retryable = values.get("retryable")
+        self.last_retryable = retryable if isinstance(retryable, bool) else None
 
     async def heartbeat(self, run: ClaimedRun) -> bool:
         return True
@@ -81,7 +84,11 @@ def claimed_run() -> ClaimedRun:
 
 
 async def fake_execute(
-    run: ClaimedRun, memory: FakeMemory
+    run: ClaimedRun,
+    memory: FakeMemory,
+    *,
+    expected_embedding_model: str,
+    expected_embedding_dim: int,
 ) -> tuple[RLMSubprocessResult, list[Memory]]:
     return RLMSubprocessResult("answer", ["evidence"], None), [
         Memory("source-1", "fact", "content", {}, 0.8)
@@ -94,6 +101,8 @@ def summary_item() -> SummaryOutboxItem:
         tenant_id="tenant-a",
         subject_id="subject-a",
         namespace="default",
+        embedding_model="provider/embed",
+        embedding_dim=3,
         content="summary",
         metadata={"run_id": "00000000-0000-0000-0000-000000000001"},
         attempts=1,
@@ -114,6 +123,8 @@ def test_summary_is_not_written_when_success_lease_is_lost(
             store=store,  # type: ignore[arg-type]
             memory=memory,  # type: ignore[arg-type]
             stale_seconds=600,
+            expected_embedding_model="provider/embed",
+            expected_embedding_dim=3,
         )
     )
 
@@ -135,6 +146,8 @@ def test_success_only_enqueues_summary_without_direct_write(
             store=store,  # type: ignore[arg-type]
             memory=memory,  # type: ignore[arg-type]
             stale_seconds=600,
+            expected_embedding_model="provider/embed",
+            expected_embedding_dim=3,
         )
     )
 
@@ -150,12 +163,16 @@ def test_outbox_summary_success_and_failure_are_durable() -> None:
             summary_item(),
             store=success_store,  # type: ignore[arg-type]
             memory=FakeMemory(),  # type: ignore[arg-type]
+            expected_embedding_model="provider/embed",
+            expected_embedding_dim=3,
         )
         retry_store = FakeStore(succeed_result=True)
         await worker._deliver_summary(
             summary_item(),
             store=retry_store,  # type: ignore[arg-type]
             memory=FakeMemory(fail_write=True),  # type: ignore[arg-type]
+            expected_embedding_model="provider/embed",
+            expected_embedding_dim=3,
         )
         return success_store, retry_store
 
@@ -164,6 +181,49 @@ def test_outbox_summary_success_and_failure_are_durable() -> None:
     assert success_store.retry_summary_calls == 0
     assert retry_store.complete_summary_calls == 0
     assert retry_store.retry_summary_calls == 1
+
+
+def test_embedding_mismatches_do_not_reach_memory_store() -> None:
+    with pytest.raises(ValueError, match="does not match worker"):
+        worker.validate_embedding_compatibility(
+            claimed_run().model_config,
+            expected_model="provider/new-embed",
+            expected_dim=3,
+        )
+
+    async def scenario() -> tuple[int, int]:
+        store = FakeStore(succeed_result=True)
+        memory = FakeMemory()
+        await worker._deliver_summary(
+            summary_item(),
+            store=store,  # type: ignore[arg-type]
+            memory=memory,  # type: ignore[arg-type]
+            expected_embedding_model="provider/new-embed",
+            expected_embedding_dim=3,
+        )
+        return memory.write_calls, store.retry_summary_calls
+
+    writes, retries = asyncio.run(scenario())
+    assert writes == 0
+    assert retries == 1
+
+
+def test_run_embedding_mismatch_fails_nonretryably_before_recall() -> None:
+    store = FakeStore(succeed_result=True)
+    memory = FakeMemory()
+    asyncio.run(
+        worker.process_claim(
+            claimed_run(),
+            store=store,  # type: ignore[arg-type]
+            memory=memory,  # type: ignore[arg-type]
+            stale_seconds=600,
+            expected_embedding_model="provider/new-embed",
+            expected_embedding_dim=3,
+        )
+    )
+    assert store.fail_calls == 1
+    assert store.last_retryable is False
+    assert memory.write_calls == 0
 
 
 def test_heartbeat_lease_loss_records_event_and_cancels_execution() -> None:

@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "rlm-api"
 version = "0.1.0"
@@ -9,6 +13,19 @@ dependencies = [
   "pydantic>=2.10.0",
   "python-dotenv>=1.0.1",
   "robyn>=0.63.0",
+]
+
+[tool.setuptools]
+py-modules = [
+  "app",
+  "auth",
+  "config",
+  "logging_config",
+  "memory",
+  "model_runtime",
+  "rlm_worker",
+  "run_store",
+  "worker",
 ]
 
 [project.optional-dependencies]

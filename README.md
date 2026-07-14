@@ -60,25 +60,28 @@ and search function schema.
 `GET /v1/models` (authenticated) safely reports active IDs and dimension; it
 never reports provider credentials.
 
+Worker operations can tune `WORKER_BATCH_SIZE`, `WORKER_POLL_SECONDS`,
+`WORKER_STALE_SECONDS`, `WORKER_RECOVERY_BATCH_SIZE` (default 100), and
+`WORKER_MAX_POLL_FAILURES` (default 5).
+
 ## Database setup
 
 Apply migrations in order:
 
 ```bash
-psql "$DATABASE_URL" -f migrations/001_memory.sql
-psql "$DATABASE_URL" -f migrations/002_search_fn.sql
-psql "$DATABASE_URL" -f migrations/003_expire_cleanup.sql
-psql "$DATABASE_URL" -f migrations/004_durable_run_queue.sql
+psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -f migrations/001_memory.sql
+psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -f migrations/002_search_fn.sql
+psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -f migrations/004_durable_run_queue.sql
 ```
 
 Run migration 004 with psql autocommit and do not wrap it in an explicit
-transaction; its memory idempotency index is built concurrently.
+transaction; its operational indexes are built concurrently.
 
-Migration 003 is periodic cleanup SQL, so schedule it with your database or
-operations scheduler. Migration 004 is idempotent and adds durable queue,
-retry, heartbeat, context, trajectory, timestamp, indexing, and idempotent
-run-summary outbox fields. Unrecoverable legacy queued/running rows are failed
-rather than made claimable with empty context.
+Migration 003 is periodic cleanup SQL, not a schema migration. Schedule it with
+your database or operations scheduler. Migration 004 is idempotent and adds
+durable queue, retry, heartbeat, context, trajectory, timestamp, indexing, and
+idempotent run-summary outbox fields. Unrecoverable legacy queued/running rows
+are failed rather than made claimable with empty context.
 
 Application queries always include the authenticated tenant identity. Existing
 PostgreSQL row-level-security settings and policies are preserved by migration
@@ -158,11 +161,12 @@ ruff check .
 pytest
 ```
 
-CI runs those checks on Python 3.12. Unit tests use fakes and require neither a
-database nor a model provider. CI does not currently run PostgreSQL integration
-tests because the hosted service does not reliably include pgvector; migration,
-RLS-role, queue-claim, and vector-search behavior must be exercised against the
-deployment's pgvector-enabled staging database.
+CI runs those checks on Python 3.12 and applies migrations 001, 002, and 004 to
+a PostgreSQL 16 service with pgvector before running the full suite. The
+integration connection owns the tables and therefore bypasses the policy-free
+RLS state created by migration 001. This validates queue semantics, not a
+production deployment's role grants or deployment-specific RLS policies; test
+those separately in staging.
 
 ## Docker
 
@@ -190,6 +194,7 @@ services.
 6. Deploy at least one API and one worker (or explicitly enable embedded mode).
 7. Configure termination grace longer than the maximum run timeout.
 8. Set `WORKER_MAX_POLL_FAILURES` for the orchestrator restart/alert policy.
+   Tune `WORKER_RECOVERY_BATCH_SIZE` (default 100) to bound stale-run locking.
 9. Probe API `/livez` and `/healthz`; monitor worker processes separately.
 10. Alert on exhausted runs, stale recovery, pending/aged summary outbox rows,
     and retry/failure logs.
@@ -199,3 +204,6 @@ Basic latency, attempt, and active root/sub-model metadata are stored in
 `rlm_runs.usage`; state changes and retry metadata are stored in `rlm_events`.
 Monitor `rlm_summary_outbox` rows with `completed_at IS NULL`, especially high
 attempt counts or old `available_at`/`claimed_at` timestamps.
+Run and summary embedding model/dimension fields are matched to each worker so
+rolling deployments never mix vector spaces; mismatched summaries remain in
+the outbox for a compatible worker.

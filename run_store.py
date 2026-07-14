@@ -41,6 +41,8 @@ class SummaryOutboxItem:
     tenant_id: str
     subject_id: str
     namespace: str
+    embedding_model: str
+    embedding_dim: int
     content: str
     metadata: dict[str, object]
     attempts: int
@@ -303,12 +305,15 @@ class RunStore:
             await connection.execute(
                 """
                 INSERT INTO rlm_summary_outbox (
-                    run_id, tenant_id, subject_id, namespace, content, metadata
+                    run_id, tenant_id, subject_id, namespace,
+                    embedding_model, embedding_dim, content, metadata
                 )
-                VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb)
+                VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8::jsonb)
                 ON CONFLICT (run_id) DO UPDATE
                 SET content = EXCLUDED.content,
                     metadata = EXCLUDED.metadata,
+                    embedding_model = EXCLUDED.embedding_model,
+                    embedding_dim = EXCLUDED.embedding_dim,
                     updated_at = now()
                 WHERE rlm_summary_outbox.completed_at IS NULL
                 """,
@@ -316,6 +321,8 @@ class RunStore:
                 run.tenant_id,
                 run.subject_id,
                 run.namespace,
+                run.model_config["embedding_model"],
+                run.model_config["embedding_dim"],
                 summary_content,
                 json.dumps(dict(summary_metadata)),
             )
@@ -401,7 +408,8 @@ class RunStore:
             FROM candidate
             WHERE item.run_id = candidate.run_id
             RETURNING item.run_id, item.tenant_id, item.subject_id,
-                      item.namespace, item.content, item.metadata, item.attempts
+                      item.namespace, item.embedding_model, item.embedding_dim,
+                      item.content, item.metadata, item.attempts
             """,
             worker_id,
             stale_seconds,
@@ -413,6 +421,8 @@ class RunStore:
             tenant_id=_required_text(row["tenant_id"], "tenant_id"),
             subject_id=_required_text(row["subject_id"], "subject_id"),
             namespace=_required_text(row["namespace"], "namespace"),
+            embedding_model=_required_text(row["embedding_model"], "embedding_model"),
+            embedding_dim=_required_int(row["embedding_dim"], "embedding_dim"),
             content=_required_text(row["content"], "content"),
             metadata=_json_object(row["metadata"]),
             attempts=_required_int(row["attempts"], "attempts"),
@@ -455,19 +465,34 @@ class RunStore:
         )
         return result == "UPDATE 1"
 
-    async def recover_stale(self, *, stale_seconds: int) -> tuple[int, int]:
+    async def recover_stale(self, *, stale_seconds: int, batch_size: int = 100) -> tuple[int, int]:
+        if stale_seconds < 1:
+            raise ValueError("stale_seconds must be positive")
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
         async with self.pool.acquire() as connection, connection.transaction():
             rows = await connection.fetch(
                 """
-                    SELECT id, attempts, max_attempts
+                WITH candidate AS (
+                    SELECT id, attempts, max_attempts,
+                           COALESCE(
+                             worker_heartbeat_at, updated_at, started_at, created_at
+                           ) AS stale_at
                     FROM rlm_runs
                     WHERE status = 'running'
                       AND COALESCE(
                             worker_heartbeat_at, updated_at, started_at, created_at
                           ) < now() - make_interval(secs => $1)
+                    ORDER BY stale_at, id
+                    LIMIT $2
                     FOR UPDATE SKIP LOCKED
-                    """,
+                )
+                SELECT id, attempts, max_attempts
+                FROM candidate
+                ORDER BY stale_at, id
+                """,
                 stale_seconds,
+                batch_size,
             )
             retried = 0
             failed = 0

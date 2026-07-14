@@ -41,6 +41,11 @@ def test_settings_require_explicit_models_and_credentials() -> None:
     with pytest.raises(ConfigurationError, match="WORKER_MAX_POLL_FAILURES"):
         Settings.from_env(env)
 
+    env = valid_env()
+    env["API_KEYS_JSON"] = json.dumps({" padded-key ": "tenant-a"})
+    with pytest.raises(ConfigurationError, match="surrounding whitespace"):
+        Settings.from_env(env)
+
 
 def test_settings_parse_tenant_and_subject_binding() -> None:
     env = valid_env()
@@ -56,6 +61,7 @@ def test_settings_parse_tenant_and_subject_binding() -> None:
     settings = Settings.from_env(env)
     assert settings.embedding_dim == 1536
     assert settings.worker_max_poll_failures == 5
+    assert settings.worker_recovery_batch_size == 100
     assert settings.api_keys["key"].subject_id == "subject-a"
 
 

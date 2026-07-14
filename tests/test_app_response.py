@@ -58,3 +58,43 @@ def test_health_fails_when_embedded_worker_has_terminated(
         return response.status_code
 
     assert asyncio.run(scenario()) == 503
+
+
+@pytest.mark.parametrize(
+    ("values", "error"),
+    [
+        ({"subject_id": "s" * 257, "q": "query"}, "invalid_subject_id"),
+        (
+            {"subject_id": "subject", "namespace": "n" * 129, "q": "query"},
+            "invalid_namespace",
+        ),
+        ({"subject_id": "subject", "q": "q" * 20_001}, "invalid_query"),
+        ({"subject_id": "subject", "q": "query", "limit": "21"}, "invalid_limit"),
+    ],
+)
+def test_memory_search_bounds_return_specific_errors(values: dict[str, str], error: str) -> None:
+    parsed, validation_error = app_module.validate_memory_search_params(values)
+    assert parsed is None
+    assert validation_error == error
+
+
+def test_overlong_memory_search_never_reaches_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeRequest:
+        headers = {"Authorization": "Bearer test-key"}
+        query_params = {"subject_id": "s" * 257, "q": "query"}
+
+    class SearchStore:
+        calls = 0
+
+        async def search(self, **values: object) -> list[object]:
+            self.calls += 1
+            return []
+
+    store = SearchStore()
+    monkeypatch.setattr(app_module, "memory_store", store)
+    response = asyncio.run(app_module.search_memory(FakeRequest()))
+    assert response.status_code == 400
+    assert json.loads(response.description) == {"error": "invalid_subject_id"}
+    assert store.calls == 0

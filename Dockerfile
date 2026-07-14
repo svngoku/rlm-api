@@ -4,7 +4,13 @@ FROM python:3.12-slim
 ENV DENO_INSTALL="/usr/local"
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl unzip ca-certificates \
-    && curl -fsSL https://deno.land/install.sh | sh \
+    && deno_installer="$(mktemp)" \
+    && trap 'rm -f "$deno_installer"' EXIT \
+    && curl --fail --silent --show-error --location \
+        --output "$deno_installer" https://deno.land/install.sh \
+    && sh "$deno_installer" \
+    && rm -f "$deno_installer" \
+    && trap - EXIT \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 appuser
 
