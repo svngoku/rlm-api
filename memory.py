@@ -2,12 +2,29 @@
 from __future__ import annotations
 
 import json
-import os
+import re
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from enum import StrEnum
+from typing import Protocol
 
 import asyncpg
-import dspy
+
+type JSONScalar = str | int | float | bool | None
+type JSONValue = JSONScalar | list[JSONValue] | dict[str, JSONValue]
+
+
+class MemoryKind(StrEnum):
+    FACT = "fact"
+    PREFERENCE = "preference"
+    DECISION = "decision"
+    EPISODE = "episode"
+    RUN_SUMMARY = "run_summary"
+    FEEDBACK = "feedback"
+
+
+class EmbeddingProvider(Protocol):
+    async def embed(self, texts: Sequence[str]) -> Sequence[Sequence[float]]: ...
 
 
 @dataclass(frozen=True)
@@ -15,30 +32,78 @@ class Memory:
     id: str
     kind: str
     content: str
-    metadata: dict[str, Any]
+    metadata: dict[str, JSONValue]
     score: float
 
 
 class MemoryStore:
-    def __init__(self, pool: asyncpg.Pool, embedding_lm: dspy.LM):
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        embedding_provider: EmbeddingProvider,
+        embedding_dim: int,
+    ) -> None:
         self.pool = pool
-        self.embedding_lm = embedding_lm
+        self.embedding_provider = embedding_provider
+        self.embedding_dim = embedding_dim
 
     @classmethod
-    async def create(cls, embedding_lm: dspy.LM) -> "MemoryStore":
+    async def create(
+        cls,
+        *,
+        database_url: str,
+        pool_size: int,
+        embedding_provider: EmbeddingProvider,
+        embedding_dim: int,
+        application_name: str = "rlm-memory",
+    ) -> MemoryStore:
         pool = await asyncpg.create_pool(
-            dsn=os.environ["DATABASE_URL"],
+            dsn=database_url,
             min_size=1,
-            max_size=int(os.getenv("DB_POOL_SIZE", "10")),
+            max_size=pool_size,
             command_timeout=30,
-            server_settings={"application_name": "rlm-memory-api"},
+            server_settings={"application_name": application_name},
         )
-        return cls(pool, embedding_lm)
+        store = cls(pool, embedding_provider, embedding_dim)
+        try:
+            await store.validate_database_dimension()
+        except Exception:
+            await pool.close()
+            raise
+        return store
 
     async def embed(self, text: str) -> list[float]:
-        """Compute embedding via the configured embedding LM."""
-        vectors = await self.embedding_lm.aembed([text])
-        return vectors[0]
+        vectors = await self.embedding_provider.embed([text])
+        if len(vectors) != 1:
+            raise ValueError("embedding provider returned an unexpected vector count")
+        vector = [float(value) for value in vectors[0]]
+        if len(vector) != self.embedding_dim:
+            raise ValueError(
+                "embedding dimension mismatch: "
+                f"expected {self.embedding_dim}, received {len(vector)}"
+            )
+        return vector
+
+    async def validate_database_dimension(self) -> None:
+        declared_type = await self.pool.fetchval(
+            """
+            SELECT format_type(attribute.atttypid, attribute.atttypmod)
+            FROM pg_attribute AS attribute
+            JOIN pg_class AS relation ON relation.oid = attribute.attrelid
+            WHERE relation.relname = 'memory_items'
+              AND attribute.attname = 'embedding'
+              AND NOT attribute.attisdropped
+            """
+        )
+        match = re.fullmatch(r"vector\((\d+)\)", str(declared_type or ""))
+        if match is None:
+            raise RuntimeError("memory_items.embedding is missing or is not fixed vector")
+        database_dim = int(match.group(1))
+        if database_dim != self.embedding_dim:
+            raise RuntimeError(
+                "EMBEDDING_DIM does not match memory_items.embedding: "
+                f"configured {self.embedding_dim}, database {database_dim}"
+            )
 
     async def search(
         self,
@@ -81,7 +146,7 @@ class MemoryStore:
                 id=str(row["id"]),
                 kind=row["kind"],
                 content=row["content"],
-                metadata=dict(row["metadata"]),
+                metadata=_json_metadata(row["metadata"]),
                 score=float(row["score"]),
             )
             for row in rows
@@ -93,9 +158,9 @@ class MemoryStore:
         tenant_id: str,
         subject_id: str,
         namespace: str = "default",
-        kind: str,
+        kind: MemoryKind,
         content: str,
-        metadata: dict[str, Any] | None = None,
+        metadata: dict[str, JSONValue] | None = None,
         importance: float = 0.5,
         expires_at: str | None = None,
     ) -> str:
@@ -117,7 +182,7 @@ class MemoryStore:
                 tenant_id,
                 subject_id,
                 namespace,
-                kind,
+                kind.value,
                 content,
                 json.dumps(metadata or {}),
                 json.dumps(embedding),
@@ -129,3 +194,10 @@ class MemoryStore:
 
     async def close(self) -> None:
         await self.pool.close()
+
+
+def _json_metadata(value: object) -> dict[str, JSONValue]:
+    decoded: object = json.loads(value) if isinstance(value, str) else value
+    if not isinstance(decoded, dict):
+        raise ValueError("memory metadata is not a JSON object")
+    return {str(key): item for key, item in decoded.items()}

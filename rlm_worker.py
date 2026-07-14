@@ -1,11 +1,43 @@
 """RLM execution worker — memory recall → DSPy RLM → memory write."""
 from __future__ import annotations
 
-from typing import Any
+from typing import Protocol
 
-import dspy
+from memory import JSONValue, Memory, MemoryKind
 
-from memory import Memory, MemoryStore
+
+class PredictionLike(Protocol):
+    answer: str
+    evidence: list[str]
+
+
+class RLMProgram(Protocol):
+    async def aforward(self, *, context: str, query: str) -> PredictionLike: ...
+
+
+class MemoryService(Protocol):
+    async def search(
+        self,
+        *,
+        tenant_id: str,
+        subject_id: str,
+        namespace: str,
+        query: str,
+        limit: int,
+    ) -> list[Memory]: ...
+
+    async def write(
+        self,
+        *,
+        tenant_id: str,
+        subject_id: str,
+        namespace: str,
+        kind: MemoryKind,
+        content: str,
+        metadata: dict[str, JSONValue],
+        importance: float,
+        expires_at: str | None = None,
+    ) -> str: ...
 
 
 def format_memory_pack(memories: list[Memory]) -> str:
@@ -31,9 +63,9 @@ async def execute_run(
     namespace: str,
     task: str,
     corpus: str,
-    memory: MemoryStore,
-    rlm: dspy.RLM,
-) -> tuple[Any, list[Memory]]:
+    memory: MemoryService,
+    rlm: RLMProgram,
+) -> tuple[PredictionLike, list[Memory]]:
     recalled = await memory.search(
         tenant_id=tenant_id,
         subject_id=subject_id,
@@ -51,12 +83,18 @@ async def execute_run(
 Return a concise answer and evidence grounded in the corpus.
 """,
     )
+    if not isinstance(prediction.answer, str):
+        raise ValueError("RLM prediction answer must be a string")
+    if not isinstance(prediction.evidence, list) or not all(
+        isinstance(item, str) for item in prediction.evidence
+    ):
+        raise ValueError("RLM prediction evidence must be a list of strings")
 
     await memory.write(
         tenant_id=tenant_id,
         subject_id=subject_id,
         namespace=namespace,
-        kind="run_summary",
+        kind=MemoryKind.RUN_SUMMARY,
         content=prediction.answer[:12_000],
         metadata={
             "run_id": run_id,
