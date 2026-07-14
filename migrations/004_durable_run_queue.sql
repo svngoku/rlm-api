@@ -1,4 +1,6 @@
 -- Durable queue fields for API/worker separation. Safe to run repeatedly.
+-- Run with psql autocommit; do not wrap this migration in a transaction because
+-- the final idempotency index is built CONCURRENTLY.
 ALTER TABLE rlm_runs
   ADD COLUMN IF NOT EXISTS namespace TEXT NOT NULL DEFAULT 'default',
   ADD COLUMN IF NOT EXISTS context TEXT,
@@ -11,10 +13,32 @@ ALTER TABLE rlm_runs
   ADD COLUMN IF NOT EXISTS worker_id TEXT,
   ADD COLUMN IF NOT EXISTS worker_heartbeat_at TIMESTAMPTZ;
 
--- Existing pre-004 rows may only have corpus_ref. New runs always store context inline.
+ALTER TABLE memory_items
+  ADD COLUMN IF NOT EXISTS source_run_id UUID;
+
+-- Recover only genuine inline legacy context.
 UPDATE rlm_runs
-SET context = COALESCE(context, corpus_ref->>'context', '')
-WHERE context IS NULL;
+SET context = corpus_ref->>'context',
+    updated_at = now()
+WHERE (context IS NULL OR btrim(context) = '')
+  AND NULLIF(btrim(corpus_ref->>'context'), '') IS NOT NULL;
+
+-- Never make an unrecoverable nonterminal run claimable with an empty corpus.
+UPDATE rlm_runs
+SET status = 'failed',
+    error = 'migration_missing_context',
+    completed_at = COALESCE(completed_at, now()),
+    updated_at = now(),
+    worker_id = NULL,
+    worker_heartbeat_at = NULL
+WHERE status IN ('queued', 'running')
+  AND (context IS NULL OR btrim(context) = '');
+
+-- Empty context is retained only as historical data on terminal legacy rows.
+UPDATE rlm_runs
+SET context = ''
+WHERE status IN ('succeeded', 'failed')
+  AND context IS NULL;
 
 ALTER TABLE rlm_runs
   ALTER COLUMN context SET NOT NULL;
@@ -22,14 +46,20 @@ ALTER TABLE rlm_runs
 DO $$
 BEGIN
   IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conname = 'rlm_runs_status_check'
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'rlm_runs_status_check'
+      AND conrelid = 'rlm_runs'::regclass
   ) THEN
     ALTER TABLE rlm_runs
       ADD CONSTRAINT rlm_runs_status_check
       CHECK (status IN ('queued', 'running', 'succeeded', 'failed'));
   END IF;
   IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conname = 'rlm_runs_attempts_check'
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'rlm_runs_attempts_check'
+      AND conrelid = 'rlm_runs'::regclass
   ) THEN
     ALTER TABLE rlm_runs
       ADD CONSTRAINT rlm_runs_attempts_check
@@ -52,9 +82,29 @@ CREATE INDEX IF NOT EXISTS rlm_runs_tenant_lookup_idx
 CREATE INDEX IF NOT EXISTS rlm_events_run_created_idx
   ON rlm_events (run_id, created_at);
 
--- The service uses one server-only database role and enforces tenant scope in every
--- application query. 001 enabled RLS without policies, which is misleading and can
--- lock out a non-owner service role. Direct database/client access is unsupported.
-ALTER TABLE memory_items DISABLE ROW LEVEL SECURITY;
-ALTER TABLE rlm_runs DISABLE ROW LEVEL SECURITY;
-ALTER TABLE rlm_events DISABLE ROW LEVEL SECURITY;
+CREATE TABLE IF NOT EXISTS rlm_summary_outbox (
+  run_id       UUID PRIMARY KEY REFERENCES rlm_runs(id) ON DELETE CASCADE,
+  tenant_id    TEXT NOT NULL,
+  subject_id   TEXT NOT NULL,
+  namespace    TEXT NOT NULL,
+  content      TEXT NOT NULL,
+  metadata     JSONB NOT NULL DEFAULT '{}'::jsonb,
+  attempts     INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  claimed_by   TEXT,
+  claimed_at   TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
+  last_error   TEXT,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE rlm_summary_outbox ENABLE ROW LEVEL SECURITY;
+
+CREATE INDEX IF NOT EXISTS rlm_summary_outbox_pending_idx
+  ON rlm_summary_outbox (available_at, created_at)
+  WHERE completed_at IS NULL;
+
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS memory_run_summary_source_idx
+  ON memory_items (tenant_id, subject_id, namespace, source_run_id)
+  WHERE source_run_id IS NOT NULL;

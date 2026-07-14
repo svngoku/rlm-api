@@ -20,9 +20,7 @@ class FakeEmbeddingProvider:
     def __init__(self, vector: Sequence[float]) -> None:
         self.vector = vector
 
-    async def embed(
-        self, texts: Sequence[str]
-    ) -> Sequence[Sequence[float]]:
+    async def embed(self, texts: Sequence[str]) -> Sequence[Sequence[float]]:
         return [self.vector for _ in texts]
 
 

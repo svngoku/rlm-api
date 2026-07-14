@@ -1,4 +1,5 @@
 """Fail-closed, tenant-bound bearer authentication."""
+
 from __future__ import annotations
 
 import hmac
@@ -28,9 +29,7 @@ class AuthenticationError(ValueError):
         self.code = code
 
 
-def authenticate(
-    request: RequestLike, credentials: Mapping[str, Credential]
-) -> Principal:
+def authenticate(request: RequestLike, credentials: Mapping[str, Credential]) -> Principal:
     """Authenticate without data-dependent short-circuiting across configured keys."""
     header = _header(request.headers, "authorization")
     scheme, separator, token = header.partition(" ")
@@ -57,9 +56,7 @@ def enforce_scope(
     tenant_id: str | None = None,
     subject_id: str | None = None,
 ) -> None:
-    if tenant_id is not None and not hmac.compare_digest(
-        tenant_id, principal.tenant_id
-    ):
+    if tenant_id is not None and not hmac.compare_digest(tenant_id, principal.tenant_id):
         raise PermissionError("tenant_mismatch")
     if (
         principal.subject_id is not None

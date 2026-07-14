@@ -7,14 +7,19 @@ Robyn HTTP process, a durable PostgreSQL queue, and pgvector/full-text memory.
 
 `POST /v1/rlm/runs` only writes a queued row. A separate `python worker.py`
 process atomically claims work with `FOR UPDATE SKIP LOCKED`, recalls tenant
-memory, executes `dspy.RLM`, writes a summary, and persists the result and
-lifecycle events. API restarts therefore do not lose accepted work.
+memory asynchronously, and executes `dspy.RLM` in a fresh spawn-based child
+process. The parent event loop remains responsive to timeouts and heartbeats and
+terminates the child on cancellation or lease loss. Success and a durable
+summary outbox row are persisted in one transaction. Workers independently
+deliver idempotent summary side effects from that outbox. Lifecycle events are
+persisted throughout, so API or worker restarts do not lose accepted work.
 
 Workers heartbeat their active lease. Stale `running` rows are recovered and
 retried with bounded exponential delays of 1, 2, 4, ... up to 300 seconds.
 Attempts are capped per run (default 3, API maximum 10). Completion updates
 require the same worker lease, preventing a stale worker from overwriting a
-recovered run.
+recovered run. One transient heartbeat exception does not imply lease loss;
+continuous uncertainty near the stale deadline cancels the child defensively.
 
 For a small single-container deployment, set `EMBEDDED_WORKER=true`. Production
 deployments should independently scale:
@@ -24,8 +29,9 @@ python app.py       # API
 python worker.py    # one or more workers
 ```
 
-Graceful shutdown stops polling, lets the current embedded run complete, and
-closes PostgreSQL pools.
+Graceful shutdown stops polling, cancels the active run and terminates its child
+process, then closes PostgreSQL pools. The stale-run recovery path safely
+requeues that interrupted lease.
 
 ## Configuration
 
@@ -65,15 +71,21 @@ psql "$DATABASE_URL" -f migrations/003_expire_cleanup.sql
 psql "$DATABASE_URL" -f migrations/004_durable_run_queue.sql
 ```
 
+Run migration 004 with psql autocommit and do not wrap it in an explicit
+transaction; its memory idempotency index is built concurrently.
+
 Migration 003 is periodic cleanup SQL, so schedule it with your database or
 operations scheduler. Migration 004 is idempotent and adds durable queue,
-retry, heartbeat, context, trajectory, timestamp, and indexing fields.
+retry, heartbeat, context, trajectory, timestamp, indexing, and idempotent
+run-summary outbox fields. Unrecoverable legacy queued/running rows are failed
+rather than made claimable with empty context.
 
-Tenant isolation is enforced in the application: authenticated tenant identity
-is included in every run and memory lookup. Migration 004 explicitly disables
-the policy-free RLS flags left by migration 001; those flags did not constitute
-working row policies. The database connection string is a server-only secret.
-Never expose the database role or direct database access to API clients.
+Application queries always include the authenticated tenant identity. Existing
+PostgreSQL row-level-security settings and policies are preserved by migration
+004; policy design is deployment-specific. Use a server-only database role
+whose ownership, grants, and RLS policies permit the required scoped queries.
+Never expose that role, its connection string, or direct database access to API
+clients.
 
 ## Authentication and tenant semantics
 
@@ -147,11 +159,15 @@ pytest
 ```
 
 CI runs those checks on Python 3.12. Unit tests use fakes and require neither a
-database nor a model provider.
+database nor a model provider. CI does not currently run PostgreSQL integration
+tests because the hosted service does not reliably include pgvector; migration,
+RLS-role, queue-claim, and vector-search behavior must be exercised against the
+deployment's pgvector-enabled staging database.
 
 ## Docker
 
-The image runs as an unprivileged user and checks `/healthz`.
+The shared API/worker image runs as an unprivileged user. It intentionally has
+no image-level healthcheck because workers do not expose the API endpoints.
 
 ```bash
 docker build -t rlm-api .
@@ -160,7 +176,9 @@ docker run --env-file .env rlm-api python worker.py
 ```
 
 Run the API and worker as separate services against the same database. The
-default command is the API.
+default command is the API. Configure HTTP `/livez` and `/healthz` probes on API
+services. Configure process-level liveness and restart policy for worker
+services.
 
 ## Deployment checklist
 
@@ -171,8 +189,13 @@ default command is the API.
 5. Apply migrations 001 through 004 and schedule migration 003 cleanup.
 6. Deploy at least one API and one worker (or explicitly enable embedded mode).
 7. Configure termination grace longer than the maximum run timeout.
-8. Alert on `/healthz`, exhausted runs, stale recovery, and retry/failure logs.
-9. Back up PostgreSQL according to the chosen provider's recovery policy.
+8. Set `WORKER_MAX_POLL_FAILURES` for the orchestrator restart/alert policy.
+9. Probe API `/livez` and `/healthz`; monitor worker processes separately.
+10. Alert on exhausted runs, stale recovery, pending/aged summary outbox rows,
+    and retry/failure logs.
+11. Back up PostgreSQL according to the chosen provider's recovery policy.
 
 Basic latency, attempt, and active root/sub-model metadata are stored in
 `rlm_runs.usage`; state changes and retry metadata are stored in `rlm_events`.
+Monitor `rlm_summary_outbox` rows with `completed_at IS NULL`, especially high
+attempt counts or old `available_at`/`claimed_at` timestamps.

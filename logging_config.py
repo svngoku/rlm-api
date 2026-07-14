@@ -1,4 +1,5 @@
 """Small structured-JSON logging adapter with context fields."""
+
 from __future__ import annotations
 
 import json

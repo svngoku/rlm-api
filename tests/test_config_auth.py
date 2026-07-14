@@ -36,6 +36,11 @@ def test_settings_require_explicit_models_and_credentials() -> None:
     with pytest.raises(ConfigurationError, match="non-empty"):
         Settings.from_env(env)
 
+    env = valid_env()
+    env["WORKER_MAX_POLL_FAILURES"] = "0"
+    with pytest.raises(ConfigurationError, match="WORKER_MAX_POLL_FAILURES"):
+        Settings.from_env(env)
+
 
 def test_settings_parse_tenant_and_subject_binding() -> None:
     env = valid_env()
@@ -50,6 +55,7 @@ def test_settings_parse_tenant_and_subject_binding() -> None:
     )
     settings = Settings.from_env(env)
     assert settings.embedding_dim == 1536
+    assert settings.worker_max_poll_failures == 5
     assert settings.api_keys["key"].subject_id == "subject-a"
 
 
@@ -60,12 +66,8 @@ def test_authentication_is_fail_closed_and_tenant_bound() -> None:
     with pytest.raises(AuthenticationError):
         authenticate(FakeRequest({"Authorization": "Bearer wrong"}), credentials)
 
-    principal = authenticate(
-        FakeRequest({"Authorization": "Bearer secret"}), credentials
-    )
-    enforce_scope(
-        principal, tenant_id="tenant-a", subject_id="subject-a"
-    )
+    principal = authenticate(FakeRequest({"Authorization": "Bearer secret"}), credentials)
+    enforce_scope(principal, tenant_id="tenant-a", subject_id="subject-a")
     with pytest.raises(PermissionError, match="tenant_mismatch"):
         enforce_scope(principal, tenant_id="tenant-b")
     with pytest.raises(PermissionError, match="subject_mismatch"):

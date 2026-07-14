@@ -1,4 +1,5 @@
 """Neon-backed hybrid memory store (semantic + full-text)."""
+
 from __future__ import annotations
 
 import json
@@ -163,7 +164,10 @@ class MemoryStore:
         metadata: dict[str, JSONValue] | None = None,
         importance: float = 0.5,
         expires_at: str | None = None,
+        source_run_id: str | None = None,
     ) -> str:
+        if source_run_id is not None and kind is not MemoryKind.RUN_SUMMARY:
+            raise ValueError("source_run_id is only valid for run summaries")
         embedding = await self.embed(content)
 
         async with self.pool.acquire() as conn:
@@ -171,12 +175,15 @@ class MemoryStore:
                 """
                 INSERT INTO memory_items (
                     tenant_id, subject_id, namespace, kind, content,
-                    metadata, embedding, importance, expires_at
+                    metadata, embedding, importance, expires_at, source_run_id
                 )
                 VALUES (
                     $1, $2, $3, $4::memory_kind, $5,
-                    $6::jsonb, $7::vector, $8, $9::timestamptz
+                    $6::jsonb, $7::vector, $8, $9::timestamptz, $10::uuid
                 )
+                ON CONFLICT (tenant_id, subject_id, namespace, source_run_id)
+                  WHERE source_run_id IS NOT NULL
+                DO UPDATE SET updated_at = memory_items.updated_at
                 RETURNING id
                 """,
                 tenant_id,
@@ -188,6 +195,7 @@ class MemoryStore:
                 json.dumps(embedding),
                 importance,
                 expires_at,
+                source_run_id,
             )
 
         return str(memory_id)

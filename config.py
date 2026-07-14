@@ -1,4 +1,5 @@
 """Validated runtime configuration."""
+
 from __future__ import annotations
 
 import json
@@ -32,6 +33,7 @@ class Settings:
     worker_poll_seconds: float = 1.0
     worker_stale_seconds: int = 600
     worker_batch_size: int = 1
+    worker_max_poll_failures: int = 5
 
     @property
     def public_model_config(self) -> dict[str, str | int]:
@@ -59,13 +61,10 @@ class Settings:
         api_keys = _parse_api_keys(required("API_KEYS_JSON"))
         embedding_dim = _positive_int(env, "EMBEDDING_DIM")
         db_pool_size = _positive_int(env, "DB_POOL_SIZE", default=10)
-        worker_stale_seconds = _positive_int(
-            env, "WORKER_STALE_SECONDS", default=600
-        )
+        worker_stale_seconds = _positive_int(env, "WORKER_STALE_SECONDS", default=600)
         worker_batch_size = _positive_int(env, "WORKER_BATCH_SIZE", default=1)
-        worker_poll_seconds = _positive_float(
-            env, "WORKER_POLL_SECONDS", default=1.0
-        )
+        worker_max_poll_failures = _positive_int(env, "WORKER_MAX_POLL_FAILURES", default=5)
+        worker_poll_seconds = _positive_float(env, "WORKER_POLL_SECONDS", default=1.0)
         if root_model == sub_model:
             warnings.warn(
                 "RLM_ROOT_MODEL and RLM_SUB_MODEL are identical; this is allowed "
@@ -84,6 +83,7 @@ class Settings:
             worker_poll_seconds=worker_poll_seconds,
             worker_stale_seconds=worker_stale_seconds,
             worker_batch_size=worker_batch_size,
+            worker_max_poll_failures=worker_max_poll_failures,
         )
 
 
@@ -109,26 +109,18 @@ def _parse_api_keys(raw: str) -> dict[str, Credential]:
             configured_role = value.get("role", "client")
             tenant_id = tenant.strip() if isinstance(tenant, str) else ""
             subject_id = subject.strip() if isinstance(subject, str) else None
-            role = (
-                configured_role.strip()
-                if isinstance(configured_role, str)
-                else "client"
-            )
+            role = configured_role.strip() if isinstance(configured_role, str) else "client"
         else:
             raise ConfigurationError(
                 "API_KEYS_JSON values must be tenant strings or credential objects"
             )
         if not tenant_id:
             raise ConfigurationError("Every API key must map to a tenant_id")
-        credentials[token] = Credential(
-            tenant_id=tenant_id, subject_id=subject_id, role=role
-        )
+        credentials[token] = Credential(tenant_id=tenant_id, subject_id=subject_id, role=role)
     return credentials
 
 
-def _positive_int(
-    env: Mapping[str, str], name: str, *, default: int | None = None
-) -> int:
+def _positive_int(env: Mapping[str, str], name: str, *, default: int | None = None) -> int:
     raw = env.get(name)
     if raw is None and default is not None:
         return default
@@ -141,9 +133,7 @@ def _positive_int(
     return value
 
 
-def _positive_float(
-    env: Mapping[str, str], name: str, *, default: float
-) -> float:
+def _positive_float(env: Mapping[str, str], name: str, *, default: float) -> float:
     try:
         value = float(env.get(name, str(default)))
     except ValueError as exc:

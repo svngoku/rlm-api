@@ -1,15 +1,16 @@
 """Robyn API for durable DSPy Recursive Language Model runs."""
+
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import json
 import logging
 import uuid
 from datetime import datetime
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError
-from robyn import Request, Robyn
+from robyn import Request, Response, Robyn
 
 from auth import (
     AuthenticationError,
@@ -108,8 +109,7 @@ async def on_shutdown() -> None:
     if embedded_stop is not None:
         embedded_stop.set()
     if embedded_task is not None:
-        with contextlib.suppress(asyncio.CancelledError):
-            await embedded_task
+        await asyncio.gather(embedded_task, return_exceptions=True)
     if memory_store is not None:
         await memory_store.close()
     if run_store is not None:
@@ -118,7 +118,7 @@ async def on_shutdown() -> None:
 
 
 @app.post("/v1/rlm/runs")
-async def create_run(request: Request) -> dict[str, object]:
+async def create_run(request: Request) -> Response:
     request_id = _request_id(request)
     principal, error = _principal(request, request_id)
     if error is not None:
@@ -153,12 +153,14 @@ async def create_run(request: Request) -> dict[str, object]:
             include_trajectory=payload.include_trajectory,
             max_attempts=payload.max_attempts,
         )
-    except Exception:
-        logger.exception(
+    except Exception as error:
+        logger.error(
             "run_enqueue_failed",
             extra={
                 "context": log_context(
-                    request_id=request_id, tenant_id=principal.tenant_id
+                    request_id=request_id,
+                    tenant_id=principal.tenant_id,
+                    exception_type=type(error).__name__,
                 )
             },
         )
@@ -182,7 +184,7 @@ async def create_run(request: Request) -> dict[str, object]:
 
 
 @app.get("/v1/rlm/runs/:run_id")
-async def get_run(request: Request) -> dict[str, object]:
+async def get_run(request: Request) -> Response:
     request_id = _request_id(request)
     principal, error = _principal(request, request_id)
     if error is not None:
@@ -193,14 +195,15 @@ async def get_run(request: Request) -> dict[str, object]:
     run_id = request.path_params.get("run_id", "")
     try:
         run = await run_store.get(run_id=run_id, tenant_id=principal.tenant_id)
-    except Exception:
-        logger.exception(
+    except Exception as error:
+        logger.error(
             "run_read_failed",
             extra={
                 "context": log_context(
                     request_id=request_id,
                     run_id=run_id,
                     tenant_id=principal.tenant_id,
+                    exception_type=type(error).__name__,
                 )
             },
         )
@@ -215,7 +218,7 @@ async def get_run(request: Request) -> dict[str, object]:
 
 
 @app.post("/v1/memories")
-async def write_memory(request: Request) -> dict[str, object]:
+async def write_memory(request: Request) -> Response:
     request_id = _request_id(request)
     principal, error = _principal(request, request_id)
     if error is not None:
@@ -249,12 +252,14 @@ async def write_memory(request: Request) -> dict[str, object]:
             importance=payload.importance,
             expires_at=payload.expires_at.isoformat() if payload.expires_at else None,
         )
-    except Exception:
-        logger.exception(
+    except Exception as error:
+        logger.error(
             "memory_write_failed",
             extra={
                 "context": log_context(
-                    request_id=request_id, tenant_id=principal.tenant_id
+                    request_id=request_id,
+                    tenant_id=principal.tenant_id,
+                    exception_type=type(error).__name__,
                 )
             },
         )
@@ -273,7 +278,7 @@ async def write_memory(request: Request) -> dict[str, object]:
 
 
 @app.get("/v1/memories/search")
-async def search_memory(request: Request) -> dict[str, object]:
+async def search_memory(request: Request) -> Response:
     request_id = _request_id(request)
     principal, error = _principal(request, request_id)
     if error is not None:
@@ -283,9 +288,7 @@ async def search_memory(request: Request) -> dict[str, object]:
     subject_id = query.get("subject_id", "")
     search_text = query.get("q", "")
     if not subject_id or not search_text:
-        return _response(
-            400, {"error": "subject_id_and_q_are_required"}, request_id
-        )
+        return _response(400, {"error": "subject_id_and_q_are_required"}, request_id)
     try:
         enforce_scope(
             principal,
@@ -309,12 +312,14 @@ async def search_memory(request: Request) -> dict[str, object]:
             query=search_text,
             limit=limit,
         )
-    except Exception:
-        logger.exception(
+    except Exception as error:
+        logger.error(
             "memory_search_failed",
             extra={
                 "context": log_context(
-                    request_id=request_id, tenant_id=principal.tenant_id
+                    request_id=request_id,
+                    tenant_id=principal.tenant_id,
+                    exception_type=type(error).__name__,
                 )
             },
         )
@@ -348,7 +353,7 @@ async def search_memory(request: Request) -> dict[str, object]:
 
 
 @app.get("/v1/models")
-async def models(request: Request) -> dict[str, object]:
+async def models(request: Request) -> Response:
     request_id = _request_id(request)
     _, error = _principal(request, request_id)
     if error is not None:
@@ -357,24 +362,28 @@ async def models(request: Request) -> dict[str, object]:
 
 
 @app.get("/livez")
-async def livez(request: Request) -> dict[str, object]:
+async def livez(request: Request) -> Response:
     return _response(200, {"ok": True}, _request_id(request))
 
 
 @app.get("/healthz")
-async def healthz(request: Request) -> dict[str, object]:
+async def healthz(request: Request) -> Response:
     request_id = _request_id(request)
-    ready = run_store is not None and await run_store.ready()
+    worker_ready = embedded_task is None or not embedded_task.done()
+    database_ready = run_store is not None and await run_store.ready()
+    ready = database_ready and worker_ready
     return _response(
         200 if ready else 503,
-        {"ok": ready, "database": "ready" if ready else "unavailable"},
+        {
+            "ok": ready,
+            "database": "ready" if database_ready else "unavailable",
+            "embedded_worker": "ready" if worker_ready else "terminated",
+        },
         request_id,
     )
 
 
-def _principal(
-    request: Request, request_id: str
-) -> tuple[Principal | None, dict[str, object] | None]:
+def _principal(request: Request, request_id: str) -> tuple[Principal | None, Response | None]:
     try:
         return authenticate(request, settings.api_keys), None
     except AuthenticationError as exc:
@@ -399,9 +408,17 @@ def _response(
     body: object,
     request_id: str,
     headers: dict[str, str] | None = None,
-) -> dict[str, object]:
-    response_headers = {"X-Request-ID": request_id, **(headers or {})}
-    return {"status_code": status_code, "headers": response_headers, "body": body}
+) -> Response:
+    response_headers = {
+        "Content-Type": "application/json",
+        "X-Request-ID": request_id,
+        **(headers or {}),
+    }
+    return Response(
+        status_code,
+        headers=response_headers,
+        body=json.dumps(body, separators=(",", ":")),
+    )
 
 
 def _validation_details(error: ValidationError) -> list[dict[str, object]]:
