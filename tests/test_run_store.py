@@ -1,0 +1,279 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import UTC, datetime
+
+import pytest
+
+from run_store import (
+    RunStatus,
+    RunStore,
+    SummaryOutboxItem,
+    decode_claimed_run,
+    failure_status,
+    retry_delay_seconds,
+    summary_retry_delay_seconds,
+)
+
+
+def claimed_row() -> dict[str, object]:
+    return {
+        "id": "00000000-0000-0000-0000-000000000001",
+        "tenant_id": "tenant-a",
+        "subject_id": "subject-a",
+        "namespace": "default",
+        "task": "question",
+        "context": "corpus",
+        "limits": ('{"max_iters":2,"max_llm_calls":3,"max_output_chars":1000,"timeout_s":30}'),
+        "model_config": (
+            '{"root_model":"provider/root","sub_model":"provider/sub",'
+            '"embedding_model":"provider/embed","embedding_dim":3}'
+        ),
+        "include_trajectory": True,
+        "attempts": 1,
+        "max_attempts": 3,
+    }
+
+
+class FakeGetPool:
+    def __init__(self, include_trajectory: bool) -> None:
+        now = datetime.now(UTC)
+        self.row = {
+            "id": "00000000-0000-0000-0000-000000000001",
+            "status": "succeeded",
+            "tenant_id": "tenant-a",
+            "subject_id": "subject-a",
+            "namespace": "default",
+            "model_config": "{}",
+            "limits": "{}",
+            "result": '{"answer":"ok"}',
+            "usage": "{}",
+            "error": None,
+            "attempts": 1,
+            "max_attempts": 3,
+            "created_at": now,
+            "updated_at": now,
+            "started_at": now,
+            "completed_at": now,
+            "memory_snapshot": "[]",
+            "include_trajectory": include_trajectory,
+            "trajectory": '[{"step":1}]',
+        }
+
+    async def fetchrow(self, query: str, run_id: str, tenant_id: str) -> dict[str, object]:
+        return self.row
+
+
+class AsyncContext:
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+    async def __aenter__(self) -> object:
+        return self.value
+
+    async def __aexit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: object,
+    ) -> None:
+        return None
+
+
+class FakeClaimConnection:
+    def __init__(self) -> None:
+        malformed = claimed_row()
+        malformed["limits"] = "{}"
+        valid = claimed_row()
+        valid["id"] = "00000000-0000-0000-0000-000000000002"
+        self.rows = [malformed, valid]
+        self.quarantined = 0
+
+    def transaction(self) -> AsyncContext:
+        return AsyncContext(self)
+
+    async def fetchrow(self, query: str, worker_id: str) -> dict[str, object] | None:
+        return self.rows.pop(0) if self.rows else None
+
+    async def fetchval(self, query: str, run_id: str) -> str:
+        return run_id
+
+    async def execute(self, query: str, *values: object) -> str:
+        if "invalid_persisted_configuration" in query:
+            self.quarantined += 1
+        return "UPDATE 1"
+
+
+class FakeClaimPool:
+    def __init__(self) -> None:
+        self.connection = FakeClaimConnection()
+
+    def acquire(self) -> AsyncContext:
+        return AsyncContext(self.connection)
+
+
+class FakeRecoveryConnection:
+    def __init__(self) -> None:
+        self.query = ""
+        self.arguments: tuple[object, ...] = ()
+
+    def transaction(self) -> AsyncContext:
+        return AsyncContext(self)
+
+    async def fetch(self, query: str, *arguments: object) -> list[object]:
+        self.query = query
+        self.arguments = arguments
+        return []
+
+
+class FakeRecoveryPool:
+    def __init__(self) -> None:
+        self.connection = FakeRecoveryConnection()
+
+    def acquire(self) -> AsyncContext:
+        return AsyncContext(self.connection)
+
+
+def summary_row() -> dict[str, object]:
+    return {
+        "run_id": "00000000-0000-0000-0000-000000000011",
+        "tenant_id": "tenant-a",
+        "subject_id": "subject-a",
+        "namespace": "default",
+        "embedding_model": "provider/embed",
+        "embedding_dim": 3,
+        "content": "summary",
+        "metadata": '{"run_id":"00000000-0000-0000-0000-000000000011"}',
+        "attempts": 1,
+    }
+
+
+class FakeSummaryPool:
+    def __init__(self) -> None:
+        malformed = summary_row()
+        malformed["embedding_dim"] = "3"
+        valid = summary_row()
+        valid["run_id"] = "00000000-0000-0000-0000-000000000012"
+        self.rows = [malformed, valid]
+        self.quarantined = 0
+
+    async def fetchrow(
+        self, query: str, worker_id: str, stale_seconds: int
+    ) -> dict[str, object] | None:
+        return self.rows.pop(0) if self.rows else None
+
+    async def execute(self, query: str, *values: object) -> str:
+        if "invalid_persisted_configuration" in query:
+            self.quarantined += 1
+        return "UPDATE 1"
+
+
+def test_retry_backoff_is_exponential_and_bounded() -> None:
+    assert [retry_delay_seconds(attempt) for attempt in range(1, 5)] == [
+        1,
+        2,
+        4,
+        8,
+    ]
+    assert retry_delay_seconds(50) == 300
+    assert summary_retry_delay_seconds(1) == 1
+    assert summary_retry_delay_seconds(50) == 900
+    with pytest.raises(ValueError):
+        retry_delay_seconds(0)
+
+
+def test_failure_transition_retries_until_last_attempt() -> None:
+    assert failure_status(1, 3) is RunStatus.QUEUED
+    assert failure_status(2, 3) is RunStatus.QUEUED
+    assert failure_status(3, 3) is RunStatus.FAILED
+    assert failure_status(1, 3, retryable=False) is RunStatus.FAILED
+    with pytest.raises(ValueError):
+        failure_status(4, 3)
+
+
+def test_claim_decoder_requires_complete_valid_configuration() -> None:
+    claimed = decode_claimed_run(claimed_row(), worker_id="worker-1")
+    assert claimed.limits["timeout_s"] == 30
+    assert claimed.model_config["root_model"] == "provider/root"
+
+    missing_limit = claimed_row()
+    missing_limit["limits"] = '{"max_iters":2}'
+    with pytest.raises(ValueError, match="missing"):
+        decode_claimed_run(missing_limit, worker_id="worker-1")
+
+    invalid_model = claimed_row()
+    invalid_model["model_config"] = '{"root_model":"","embedding_dim":3}'
+    with pytest.raises(ValueError):
+        decode_claimed_run(invalid_model, worker_id="worker-1")
+
+
+def test_get_only_exposes_requested_trajectory() -> None:
+    without = RunStore(FakeGetPool(False))  # type: ignore[arg-type]
+    result = asyncio.run(
+        without.get(
+            run_id="00000000-0000-0000-0000-000000000001",
+            tenant_id="tenant-a",
+        )
+    )
+    assert result is not None
+    assert "trajectory" not in result
+
+    with_trajectory = RunStore(FakeGetPool(True))  # type: ignore[arg-type]
+    result = asyncio.run(
+        with_trajectory.get(
+            run_id="00000000-0000-0000-0000-000000000001",
+            tenant_id="tenant-a",
+        )
+    )
+    assert result is not None
+    assert result["trajectory"] == [{"step": 1}]
+
+
+def test_claim_quarantines_poison_and_continues_to_valid_row() -> None:
+    pool = FakeClaimPool()
+    store = RunStore(pool)  # type: ignore[arg-type]
+    claimed = asyncio.run(store.claim(worker_id="worker-1", max_quarantined=3))
+    assert claimed is not None
+    assert claimed.id == "00000000-0000-0000-0000-000000000002"
+    assert pool.connection.quarantined == 1
+
+
+def test_stale_recovery_is_bounded_and_deterministically_ordered() -> None:
+    pool = FakeRecoveryPool()
+    store = RunStore(pool)  # type: ignore[arg-type]
+    assert asyncio.run(store.recover_stale(stale_seconds=60, batch_size=7)) == (
+        0,
+        0,
+    )
+    assert pool.connection.arguments == (60, 7)
+    assert "ORDER BY stale_at, id" in pool.connection.query
+    assert "LIMIT $2" in pool.connection.query
+    assert pool.connection.query.index("LIMIT $2") < pool.connection.query.index(
+        "FOR UPDATE SKIP LOCKED"
+    )
+    with pytest.raises(ValueError, match="batch_size"):
+        asyncio.run(store.recover_stale(stale_seconds=60, batch_size=0))
+
+
+def test_summary_claim_quarantines_poison_and_continues() -> None:
+    pool = FakeSummaryPool()
+    store = RunStore(pool)  # type: ignore[arg-type]
+    item = asyncio.run(
+        store.claim_summary(
+            worker_id="summary-worker",
+            stale_seconds=60,
+            max_quarantined=3,
+        )
+    )
+    assert isinstance(item, SummaryOutboxItem)
+    assert item.run_id == "00000000-0000-0000-0000-000000000012"
+    assert pool.quarantined == 1
+
+    with pytest.raises(ValueError, match="max_quarantined"):
+        asyncio.run(
+            store.claim_summary(
+                worker_id="summary-worker",
+                stale_seconds=60,
+                max_quarantined=0,
+            )
+        )
